@@ -1,4 +1,6 @@
-# NotchBlob
+<p align="center"><img src="assets/icon.png" width="128" alt="NotchBlob icon"></p>
+
+<h1 align="center">NotchBlob</h1>
 
 A living-ink blob that makes your MacBook's notch look alive. It sits exactly on the notch, starts as the notch's own shape, and when you speak it swells outward about 20% in thick, oily, organic lumps, then settles back when you stop.
 
