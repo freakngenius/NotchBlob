@@ -1,4 +1,4 @@
-# Notch Alive
+# NotchBlob
 
 A living-ink blob that makes your MacBook's notch look alive. It sits exactly on the notch, starts as the notch's own shape, and when you speak it swells outward about 20% in thick, oily, organic lumps, then settles back when you stop.
 
@@ -7,7 +7,7 @@ Free, no accounts, no API keys, no network. Audio is analysed live on your Mac a
 ## Install (copy and paste into Terminal)
 
 ```bash
-xcode-select --install 2>/dev/null; git clone https://github.com/freakngenius/notch-alive.git && cd notch-alive/notch-app && ./build.sh && open NotchAlive.app
+xcode-select --install 2>/dev/null; git clone https://github.com/freakngenius/NotchBlob.git && cd NotchBlob/notch-app && ./build.sh && open NotchAlive.app
 ```
 
 If a dialog appears for the Xcode command line tools, finish that install, then run the same line again.
