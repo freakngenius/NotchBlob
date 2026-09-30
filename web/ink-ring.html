@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ink ring</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #f2ecdf; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  var cv = document.getElementById('c');
+  var ctx = cv.getContext('2d');
+
+  // ?seed=7 -> integer seed; any other text is hashed. No seed -> 1.
+  var q = new URLSearchParams(location.search).get('seed');
+  function hashStr(s) {
+    var h = 2166136261;
+    for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return h >>> 0;
+  }
+  var seed = q === null ? 1 : (/^-?\d+$/.test(q.trim()) ? (parseInt(q, 10) >>> 0) : hashStr(q));
+
+  function mulberry(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var R = mulberry(seed * 2654435761 >>> 0);
+  function rand(a, b) { return a + (b - a) * R(); }
+
+  // A set of sine harmonics: integer k keeps the contour closed at 2*PI.
+  // Each one is a travelling wave. Its time frequency is a whole number of
+  // cycles per LOOP seconds, so the whole animation returns to frame zero exactly.
+  var LOOP = 16;
+  function harmonics(kMin, kMax, amp, falloff, mMax) {
+    var list = [];
+    for (var k = kMin; k <= kMax; k++) {
+      var m = Math.ceil(R() * mMax) * (R() < 0.5 ? -1 : 1);
+      list.push({
+        k: k,
+        a: amp * rand(0.3, 1) / Math.pow(k, falloff),
+        p: rand(0, Math.PI * 2),
+        w: m * Math.PI * 2 / LOOP
+      });
+    }
+    return list;
+  }
+  function sample(list, th, t) {
+    var s = 0;
+    for (var i = 0; i < list.length; i++) {
+      var h = list[i];
+      s += h.a * Math.sin(h.k * th + h.p + h.w * t);
+    }
+    return s;
+  }
+
+  // Everything below varies with the seed.
+  var P = {
+    radius: rand(0.29, 0.35),            // fraction of the short side
+    weight: rand(0.26, 0.46),            // stroke thickness / radius
+    dx: rand(-0.03, 0.03),
+    dy: rand(-0.03, 0.02),
+    body: harmonics(1, 5, 0.07, 1.0, 2),          // the whole ring sways and breathes
+    press: harmonics(1, 3, 0.30, 0.9, 2),         // ink pools thick, then thins, flowing around
+    edgeOut: harmonics(3, 14, 0.016, 0.6, 3),     // liquid ripples, outside
+    edgeIn: harmonics(3, 14, 0.016, 0.6, 3),      // liquid ripples, inside
+    tilt: rand(0, Math.PI * 2)
+  };
+
+  var W = 0, H = 0, dpr = 1, paper = null;
+
+  function makePaper() {
+    var pw = Math.floor(W * dpr), ph = Math.floor(H * dpr);
+    paper = document.createElement('canvas');
+    paper.width = pw; paper.height = ph;
+    var pc = paper.getContext('2d');
+    var pr = mulberry(seed ^ 0x9e3779b9);
+
+    pc.fillStyle = '#f2ecdf';
+    pc.fillRect(0, 0, pw, ph);
+
+    // fine grain, generated small and stretched so it stays cheap
+    var gw = Math.ceil(pw / 2), gh = Math.ceil(ph / 2);
+    var g = document.createElement('canvas');
+    g.width = gw; g.height = gh;
+    var gc = g.getContext('2d');
+    var img = gc.createImageData(gw, gh), d = img.data;
+    for (var i = 0; i < d.length; i += 4) {
+      var v = pr() < 0.5 ? 0 : 255;
+      d[i] = d[i + 1] = d[i + 2] = v;
+      d[i + 3] = Math.floor(pr() * 9);
+    }
+    gc.putImageData(img, 0, 0);
+    pc.drawImage(g, 0, 0, pw, ph);
+
+    // a few faint fibres
+    pc.lineWidth = Math.max(1, dpr * 0.6);
+    for (var n = 0; n < 160; n++) {
+      var x = pr() * pw, y = pr() * ph, a = pr() * Math.PI * 2, l = (8 + pr() * 26) * dpr;
+      pc.strokeStyle = 'rgba(120,95,60,' + (0.04 + pr() * 0.05).toFixed(3) + ')';
+      pc.beginPath();
+      pc.moveTo(x, y);
+      pc.quadraticCurveTo(x + Math.cos(a + 0.5) * l * 0.5, y + Math.sin(a + 0.5) * l * 0.5,
+                          x + Math.cos(a) * l, y + Math.sin(a) * l);
+      pc.stroke();
+    }
+
+    // warm vignette
+    var vg = pc.createRadialGradient(pw / 2, ph / 2, Math.min(pw, ph) * 0.35,
+                                     pw / 2, ph / 2, Math.hypot(pw, ph) * 0.6);
+    vg.addColorStop(0, 'rgba(255,250,238,0)');
+    vg.addColorStop(1, 'rgba(150,120,80,0.16)');
+    pc.fillStyle = vg;
+    pc.fillRect(0, 0, pw, ph);
+  }
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = Math.floor(W * dpr);
+    cv.height = Math.floor(H * dpr);
+    makePaper();
+    if (typeof t === 'number') draw(t); // resizing clears the canvas; repaint at once, even while frozen
+  }
+
+  var N = 420;
+
+  function draw(t) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(paper, 0, 0);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    var s = Math.min(W, H);
+    var cx = W / 2 + P.dx * s, cy = H / 2 + P.dy * s;
+    var mid = P.radius * s;
+
+    var outer = [], inner = [];
+    for (var i = 0; i < N; i++) {
+      var th = i / N * Math.PI * 2;
+      var r = mid * (1 + sample(P.body, th, t));
+      var w = mid * P.weight * (1 + sample(P.press, th + P.tilt, t));
+      var ro = r + w / 2 + mid * sample(P.edgeOut, th, t);
+      var ri = r - w / 2 + mid * sample(P.edgeIn, th, t);
+      var c = Math.cos(th), sn = Math.sin(th);
+      outer.push(cx + c * ro, cy + sn * ro);
+      inner.push(cx + c * ri, cy + sn * ri);
+    }
+
+    ctx.beginPath();
+    ctx.moveTo(outer[0], outer[1]);
+    for (var a = 2; a < outer.length; a += 2) ctx.lineTo(outer[a], outer[a + 1]);
+    ctx.closePath();
+    ctx.moveTo(inner[0], inner[1]);
+    for (var b = 2; b < inner.length; b += 2) ctx.lineTo(inner[b], inner[b + 1]);
+    ctx.closePath();
+
+    // shadow offsets and blur are in device pixels, not affected by the transform
+    ctx.save();
+    ctx.shadowColor = 'rgba(35,22,10,0.38)';
+    ctx.shadowBlur = s * 0.045 * dpr;
+    ctx.shadowOffsetX = s * 0.004 * dpr;
+    ctx.shadowOffsetY = s * 0.016 * dpr;
+    ctx.fillStyle = '#000';
+    ctx.fill('evenodd');
+    ctx.restore();
+  }
+
+  var t = 0, last = null, paused = false;
+  function frame(now) {
+    if (last !== null && !paused) t += Math.min((now - last) / 1000, 0.1);
+    last = now;
+    draw(t);
+    requestAnimationFrame(frame);
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' || e.key === ' ') { e.preventDefault(); if (!e.repeat) paused = !paused; }
+  });
+
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

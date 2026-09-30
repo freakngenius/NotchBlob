@@ -1,0 +1,708 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Voice ink blob</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #f2ecdf; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/*
+  Say "orange" to wake the blob. While awake it grows only while it hears a
+  human voice, and pulls back to a dot a fraction of a second after you stop.
+  It goes back to sleep after 12 s without a voice.
+
+  Needs Chrome or Edge (keyword listening uses the browser's speech recogniser),
+  served from http://localhost so the mic permission sticks.
+
+  O        wake it by hand
+  Space    freeze
+  ?seed=7  different blob personality
+  ?wake=1  start awake and never sleep (skips the keyword)
+  ?demo=1  no mic: a synthetic voice drives it, for testing
+*/
+(function () {
+  var cv = document.getElementById('c');
+  var ctx = cv.getContext('2d');
+  var params = new URLSearchParams(location.search);
+  var TAU = Math.PI * 2;
+
+  var q = params.get('seed');
+  function hashStr(s) {
+    var h = 2166136261;
+    for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return h >>> 0;
+  }
+  var seed = q === null ? 1 : (/^-?\d+$/.test(q.trim()) ? (parseInt(q, 10) >>> 0) : hashStr(q));
+  function mulberry(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var R = mulberry(seed * 2654435761 >>> 0);
+  var DR = mulberry((seed + 77) * 40503 >>> 0);   // droplets, kept apart so they never disturb the personality
+  function rand(a, b) { return a + (b - a) * R(); }
+  function clamp(x, a, b) { return x < a ? a : x > b ? b : x; }
+
+  var DEMO = params.get('demo') === '1';
+  var ALWAYS = DEMO || params.get('wake') === '1';
+
+  // ---------- state: asleep until the keyword ----------
+  var SLEEP_AFTER = 12;      // seconds without a voice
+  var mode = { awake: ALWAYS, since: 0, pulse: 0 };
+
+  function wake(why) {
+    if (mode.awake) { mode.since = clock; return; }
+    mode.awake = true; mode.since = clock; mode.pulse = 1;
+    kw.heard = why;
+  }
+  function sleep() {
+    mode.awake = false;
+    if (kw.rec) { try { kw.rec.abort(); } catch (e) {} }   // restarts fresh so old words can't retrigger
+  }
+
+  // ---------- microphone ----------
+  var audio = { state: 'idle', err: '', label: '', ac: null, an: null, fbuf: null, tbuf: null, hzPerBin: 1 };
+
+  function startMic() {
+    if (audio.ac && audio.ac.state === 'suspended') audio.ac.resume();
+    if (DEMO || audio.state === 'asking' || audio.state === 'live') return;
+    audio.state = 'asking';
+    var md = navigator.mediaDevices;
+    if (!md || !md.getUserMedia) { audio.state = 'denied'; audio.err = 'unsupported'; return; }
+    md.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } })
+      .then(function (stream) {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        var ac = new AC();
+        var src = ac.createMediaStreamSource(stream);
+        var an = ac.createAnalyser();
+        an.fftSize = 1024;
+        an.smoothingTimeConstant = 0;
+        an.minDecibels = -110; an.maxDecibels = -20;
+        src.connect(an);
+        audio.ac = ac; audio.an = an;
+        audio.fbuf = new Float32Array(an.frequencyBinCount);
+        audio.tbuf = new Float32Array(an.fftSize);
+        audio.hzPerBin = ac.sampleRate / an.fftSize;
+        var track = stream.getAudioTracks()[0];
+        audio.label = track && track.label ? track.label : 'default microphone';
+        if (track) track.addEventListener('ended', function () { audio.state = 'lost'; });
+        audio.state = 'live';
+        if (ac.state === 'suspended') ac.resume();
+        startKeyword();
+      })
+      .catch(function (e) {
+        audio.state = 'denied';
+        audio.err = (e && e.name) || 'error';
+      });
+  }
+
+  // ---------- the keyword ----------
+  var kw = { state: 'off', rec: null, local: true, stop: false, heard: '', last: '', err: '' };
+
+  function startKeyword() {
+    if (ALWAYS || kw.stop) return;
+    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { kw.state = 'unsupported'; return; }
+    var rec = new SR();
+    rec.lang = 'en-US';
+    rec.continuous = true;
+    rec.interimResults = true;     // interim results make "orange" land as soon as it is said
+    rec.maxAlternatives = 3;
+    if ('processLocally' in rec) { try { rec.processLocally = kw.local; } catch (e) {} }
+    rec.onstart = function () { kw.state = 'listening'; };
+    rec.onresult = function (e) {
+      for (var i = e.resultIndex; i < e.results.length; i++) {
+        kw.last = e.results[i][0].transcript.trim().slice(-40);
+        for (var a = 0; a < e.results[i].length; a++) {
+          if (/\boranges?\b/i.test(e.results[i][a].transcript)) { wake('orange'); return; }
+        }
+      }
+    };
+    rec.onerror = function (e) {
+      if (e.error === 'language-not-supported' && kw.local) kw.local = false;   // no on-device pack: use the online one
+      else if (e.error === 'not-allowed' || e.error === 'service-not-allowed') { kw.state = 'blocked'; kw.stop = true; }
+      else if (e.error === 'network') kw.state = 'network';
+      kw.err = e.error;
+    };
+    rec.onend = function () {
+      if (kw.stop) return;
+      setTimeout(startKeyword, 250);
+    };
+    kw.rec = rec;
+    try { rec.start(); } catch (e) {}
+  }
+
+  // ---------- voice detection: a voice, not just a sound ----------
+  var vad = {
+    active: false, run: 0, lastVoice: -9,
+    floorP: 1e-12, bandFloor: new Float64Array(6).fill(1e-12),
+    snrDb: 0, peakDb: 14, ratio: 0, level: 0, calibrating: false
+  };
+  var voice = { env: 0, slow: 0, bands: new Float32Array(6), drive: 0 };
+
+  var EDGES = [120, 250, 500, 1000, 2000, 3500, 5500];
+
+  var calib = 0, calibStart = null;
+  function analyse(t) {
+    var an = audio.an, f = audio.fbuf, hz = audio.hzPerBin, i, p;
+    an.getFloatFrequencyData(f);
+    var b60 = Math.max(1, Math.round(60 / hz)), b250 = Math.round(250 / hz), b3800 = Math.round(3800 / hz);
+    var speechP = 0, totalP = 0;
+    for (i = b60; i < f.length; i++) {
+      p = Math.pow(10, f[i] / 10);
+      totalP += p;
+      if (i >= b250 && i <= b3800) speechP += p;
+    }
+    var ratio = speechP / (totalP + 1e-20);      // how much of the sound lives where speech lives
+    var bp = [];
+    for (var j = 0; j < 6; j++) {
+      var a = Math.max(1, Math.round(EDGES[j] / hz)), b = Math.max(a + 1, Math.round(EDGES[j + 1] / hz)), s = 0;
+      for (i = a; i < b; i++) s += Math.pow(10, f[i] / 10);
+      bp.push(s / (b - a));
+    }
+
+    // first half second: learn the room before judging anything
+    if (calibStart === null) calibStart = t;
+    if (calib < 8 || t - calibStart < 0.7) {
+      calib++;
+      var k = calib === 1 ? 1 : 0.3;
+      vad.floorP += ((calib === 1 ? speechP : speechP) - (calib === 1 ? 0 : vad.floorP)) * k;
+      for (j = 0; j < 6; j++) vad.bandFloor[j] += (bp[j] - (calib === 1 ? 0 : vad.bandFloor[j])) * k;
+      vad.active = false; vad.level = 0; vad.snrDb = 0; vad.calibrating = true;
+      return [0, 0, 0, 0, 0, 0];
+    }
+    vad.calibrating = false;
+
+    // the floor drops fast and rises slowly, and never freezes, so it cannot get stuck on
+    var rate = speechP < vad.floorP ? 0.2 : (vad.active ? 0.0015 : 0.02);
+    vad.floorP = Math.max(vad.floorP + (speechP - vad.floorP) * rate, 1e-13);
+    var snrDb = 10 * Math.log10((speechP + 1e-20) / vad.floorP);
+
+    // a voice is clearly above the room and sits in the speech range; it is easier to keep than to start
+    var cand = vad.active ? (snrDb > 3 && ratio > 0.12) : (snrDb > 6 && ratio > 0.2);
+    if (cand) { vad.lastVoice = t; vad.active = true; }
+    else if (t - vad.lastVoice > 0.05) vad.active = false;
+
+    vad.peakDb = Math.max(vad.peakDb - 0.03, snrDb, 14);
+    vad.snrDb = snrDb; vad.ratio = ratio;
+    vad.level = vad.active ? Math.pow(clamp((snrDb - 4) / (vad.peakDb - 4), 0, 1), 0.6) : 0;
+
+    var out = [];
+    for (j = 0; j < 6; j++) {
+      var br = bp[j] < vad.bandFloor[j] ? 0.2 : (vad.active ? 0.0015 : 0.02);
+      vad.bandFloor[j] = Math.max(vad.bandFloor[j] + (bp[j] - vad.bandFloor[j]) * br, 1e-13);
+      var db = 10 * Math.log10((bp[j] + 1e-20) / vad.bandFloor[j]);
+      out.push(vad.active ? clamp((db - 3) / 14, 0, 1) : 0);
+    }
+    return out;
+  }
+
+  function demoVoice(t) {
+    var phrase = clamp(Math.sin(TAU * 0.13 * t + 1.0) * 3 + 0.8, 0, 1);
+    var syl = Math.pow(Math.max(0, Math.sin(TAU * (2.6 + 0.7 * Math.sin(TAU * 0.11 * t)) * t)), 1.4);
+    var raw = phrase * (0.25 + 0.75 * syl);
+    var on = raw > 0.08;
+    var b = [];
+    for (var j = 0; j < 6; j++) {
+      b.push(on ? raw * clamp(0.6 + 0.6 * Math.sin(t * (1.1 + j * 0.63) + j * 1.9) * Math.sin(t * 0.37 + j), 0, 1) : 0);
+    }
+    vad.active = on; vad.snrDb = raw * 30; vad.lastVoice = on ? t : vad.lastVoice;
+    return { level: on ? raw : 0, bands: b };
+  }
+
+  function updateVoice(t, dt) {
+    var level = 0, bands = null, i;
+    if (DEMO) {
+      var d = demoVoice(t); level = d.level; bands = d.bands;
+    } else if (audio.state === 'live') {
+      bands = analyse(t);
+      level = vad.level;
+    }
+    // only listens for a voice once woken
+    var gate = mode.awake;
+    if (!gate) { level = 0; bands = null; }
+
+    // quick to rise, quick to fall: this is what keeps it tied to the voice
+    var up = 1 - Math.exp(-dt / 0.06), down = 1 - Math.exp(-dt / 0.14);
+    voice.env += (level - voice.env) * (level > voice.env ? up : down);
+    voice.slow += (level - voice.slow) * (1 - Math.exp(-dt / 0.25));
+    for (i = 0; i < 6; i++) {
+      var x = bands ? bands[i] : 0;
+      voice.bands[i] += (x - voice.bands[i]) * (x > voice.bands[i] ? up : down);
+    }
+
+    if (mode.awake && !ALWAYS) {
+      if (vad.active) mode.since = t;
+      else if (t - mode.since > SLEEP_AFTER) sleep();
+    }
+    mode.pulse = Math.max(0, mode.pulse - dt * 2.2);
+  }
+
+  // ---------- the body: a head of lumpy lobes with limbs that wander, never repeating ----------
+  var WR = mulberry((seed + 991) * 7919 >>> 0);      // runtime randomness, seeded but never cycling
+  function wn() { return WR() * 2 - 1; }
+  var NA = 12, NH = 7;
+  var arms = [], heads = [];
+  // direction drifts by a smoothed velocity, so paths are flowing curves, not a jittering random walk
+  function wander(o, amp, dt) {
+    var d = Math.exp(-2 * dt), sq = Math.sqrt(dt);
+    o.vx = (o.vx || 0) * d + wn() * amp * sq;
+    o.vy = (o.vy || 0) * d + wn() * amp * sq;
+    o.vz = (o.vz || 0) * d + wn() * amp * sq;
+    o.ux += o.vx * dt; o.uy += o.vy * dt; o.uz += o.vz * dt;
+    unit(o);
+  }
+  function unit(o) {
+    var l = Math.sqrt(o.ux * o.ux + o.uy * o.uy + o.uz * o.uz) || 1;
+    o.ux /= l; o.uy /= l; o.uz /= l;
+  }
+  (function () {
+    var i, o;
+    for (i = 0; i < NA; i++) {
+      var y = 1 - 2 * (i + 0.5) / NA, rr = Math.sqrt(1 - y * y), th = i * 2.39996 + rand(-0.35, 0.35);
+      arms.push({
+        ux: Math.cos(th) * rr, uy: y, uz: Math.sin(th) * rr,
+        band: i % 6, t: rand(0, 2),
+        reach: rand(0.4, 1), reachT: rand(0.4, 1.2),
+        size: rand(0.7, 1.2), sizeT: rand(0.6, 1.3),
+        asp: rand(1, 1.8), aspT: rand(1, 2),
+        e: 0, v: 0, r: 0, rv: 0
+      });
+    }
+    for (i = 0; i < NH; i++) {
+      o = { ux: wn(), uy: wn(), uz: wn(), t: rand(0, 3),
+            len: rand(0.6, 1.1), lenT: rand(0.5, 1.2), f: rand(0.6, 0.95), fT: rand(0.55, 1),
+            asp: rand(0.7, 1.5), aspT: rand(0.7, 1.6), rot: rand(0, TAU), rw: rand(-0.6, 0.6) };
+      unit(o);
+      heads.push(o);
+    }
+  })();
+  var hg = { e: 0, v: 0 };           // how much of the head has grown; rises early so small sounds already make lumps
+  var spin = { yaw: rand(0, TAU), pitch: 0, tp: rand(0, TAU) };
+  var drops = [];
+  var prevEnv = 0, dropCool = 0;
+  var SPR = { k: 170, c: 29 };       // overdamped: slow, oily, no bounce
+
+  function step(dt, t) {
+    var i, a, h, sq = Math.sqrt(dt), ch = 1 - Math.exp(-dt * 0.9);
+    for (i = 0; i < NA; i++) {
+      a = arms[i];
+      wander(a, 0.8 + 1.0 * voice.slow, dt);
+      a.t -= dt;
+      if (a.t < 0) {
+        a.t = 1 + WR() * 2.5;
+        a.reachT = 0.35 + WR() * 0.95; a.sizeT = 0.6 + WR() * 0.8; a.aspT = 1 + WR();
+        if (WR() < 0.35) a.band = Math.floor(WR() * 6);        // a limb changes which part of the voice it follows
+      }
+      a.reach += (a.reachT - a.reach) * ch; a.size += (a.sizeT - a.size) * ch; a.asp += (a.aspT - a.asp) * ch;
+      // limbs follow a lazier copy of the voice, so syllables blur into one swelling instead of twitching
+      var tb = voice.bands[a.band];
+      a.E = (a.E || 0) + (tb - (a.E || 0)) * (1 - Math.exp(-dt / (tb > (a.E || 0) ? 0.09 : 0.22)));
+      var E = a.E;
+      a.v += (SPR.k * (E * a.reach * 0.85 - a.e) - SPR.c * a.v) * dt;
+      a.e += a.v * dt;
+      a.rv += (SPR.k * 0.8 * (E * a.size - a.r) - SPR.c * 0.9 * a.rv) * dt;
+      a.r += a.rv * dt;
+    }
+    for (i = 0; i < NH; i++) {
+      h = heads[i];
+      wander(h, 0.5 + 0.6 * voice.slow, dt);
+      h.t -= dt;
+      if (h.t < 0) { h.t = 1.5 + WR() * 3; h.lenT = 0.5 + WR() * 0.7; h.fT = 0.55 + WR() * 0.45; h.aspT = 0.7 + WR() * 0.9; h.rw = wn() * 0.7; }
+      h.len += (h.lenT - h.len) * ch; h.f += (h.fT - h.f) * ch; h.asp += (h.aspT - h.asp) * ch;
+      h.rot += h.rw * dt * (0.4 + voice.env);
+    }
+    var he = Math.pow(voice.env, 0.55);
+    hg.T = (hg.T || 0) + (he - (hg.T || 0)) * (1 - Math.exp(-dt / (he > (hg.T || 0) ? 0.08 : 0.2)));
+    hg.v += (SPR.k * (hg.T - hg.e) - SPR.c * hg.v) * dt;
+    hg.e += hg.v * dt;
+
+    spin.yaw += (0.15 + 1.1 * voice.env) * dt;
+    spin.tp += (0.2 + 0.5 * voice.env) * dt;
+    spin.pitch = 0.55 * Math.sin(spin.tp);
+
+    for (i = drops.length - 1; i >= 0; i--) {
+      var d = drops[i];
+      d.x += d.vx * dt; d.y += d.vy * dt;
+      var drag = Math.exp(-2.6 * dt);
+      d.vx *= drag; d.vy *= drag;
+      d.life -= dt;
+      if (d.life <= 0) drops.splice(i, 1);
+    }
+    dropCool -= dt;
+  }
+
+  function maybeSpawnDrops() {
+    // a sudden onset flings a few droplets that pinch off and merge back
+    if (voice.env - prevEnv > 0.06 && voice.env > 0.4 && dropCool <= 0 && drops.length < 4) {
+      var n = 1 + Math.floor(voice.env * 1.5);
+      for (var i = 0; i < n; i++) {
+        var ang = DR() * TAU, sp = (0.12 + 0.2 * DR()) * (0.5 + voice.env);
+        drops.push({ x: 0, y: 0, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp, r: 0.02 + 0.025 * DR(), life: 0.8 + 0.4 * DR(), life0: 1.2 });
+      }
+      dropCool = 0.4;
+    }
+    prevEnv = voice.env;
+  }
+
+  // ---------- drawing ----------
+  var W = 0, H = 0, dpr = 1, paper = null;
+  var field, fctx, outc, octx, GW = 2, GH = 2, SC = 1, sprite;
+  var LW = 2, LH = 2, loA, loB, lcA, lcB, hlc, hlx, hlImg, hlc2, hlx2, hlImg2, hmask, hmx;
+
+  var sprite2;
+  function makeSprite() {
+    // the metaball kernel (1-u^2)^2; its half-height contour sits at u = 0.54
+    sprite = document.createElement('canvas');
+    sprite.width = sprite.height = 256;
+    var sc = sprite.getContext('2d');
+    var g = sc.createRadialGradient(128, 128, 0, 128, 128, 128);
+    for (var i = 0; i <= 64; i++) {
+      var u = i / 64, f = (1 - u * u); f = f * f;
+      g.addColorStop(u, 'rgba(255,255,255,' + f.toFixed(4) + ')');
+    }
+    sc.fillStyle = g;
+    sc.fillRect(0, 0, 256, 256);
+
+    // the same kernel on a rounded square: flatter sides and corners, for lumpy, less circular lobes
+    var N2 = 256, P = 3;
+    sprite2 = document.createElement('canvas');
+    sprite2.width = sprite2.height = N2;
+    var c2 = sprite2.getContext('2d');
+    var im = c2.createImageData(N2, N2), dd = im.data;
+    for (var y = 0; y < N2; y++) {
+      for (var x = 0; x < N2; x++) {
+        var px = Math.abs((x + 0.5) / N2 * 2 - 1), py = Math.abs((y + 0.5) / N2 * 2 - 1);
+        var dist = Math.pow(Math.pow(px, P) + Math.pow(py, P), 1 / P);
+        var k = dist >= 1 ? 0 : (1 - dist * dist) * (1 - dist * dist), o = (y * N2 + x) * 4;
+        dd[o] = dd[o + 1] = dd[o + 2] = 255; dd[o + 3] = Math.round(255 * k);
+      }
+    }
+    c2.putImageData(im, 0, 0);
+  }
+
+  function makePaper() {
+    var pw = Math.floor(W * dpr), ph = Math.floor(H * dpr);
+    paper = document.createElement('canvas');
+    paper.width = pw; paper.height = ph;
+    var pc = paper.getContext('2d');
+    var pr = mulberry(seed ^ 0x9e3779b9);
+    pc.fillStyle = '#f2ecdf';
+    pc.fillRect(0, 0, pw, ph);
+    var gw = Math.ceil(pw / 2), gh = Math.ceil(ph / 2);
+    var g = document.createElement('canvas');
+    g.width = gw; g.height = gh;
+    var gc = g.getContext('2d');
+    var img = gc.createImageData(gw, gh), d = img.data;
+    for (var i = 0; i < d.length; i += 4) {
+      var v = pr() < 0.5 ? 0 : 255;
+      d[i] = d[i + 1] = d[i + 2] = v;
+      d[i + 3] = Math.floor(pr() * 9);
+    }
+    gc.putImageData(img, 0, 0);
+    pc.drawImage(g, 0, 0, pw, ph);
+    pc.lineWidth = Math.max(1, dpr * 0.6);
+    for (var n = 0; n < 160; n++) {
+      var x = pr() * pw, y = pr() * ph, a = pr() * TAU, l = (8 + pr() * 26) * dpr;
+      pc.strokeStyle = 'rgba(120,95,60,' + (0.04 + pr() * 0.05).toFixed(3) + ')';
+      pc.beginPath();
+      pc.moveTo(x, y);
+      pc.quadraticCurveTo(x + Math.cos(a + 0.5) * l * 0.5, y + Math.sin(a + 0.5) * l * 0.5,
+                          x + Math.cos(a) * l, y + Math.sin(a) * l);
+      pc.stroke();
+    }
+    var vg = pc.createRadialGradient(pw / 2, ph / 2, Math.min(pw, ph) * 0.35,
+                                     pw / 2, ph / 2, Math.hypot(pw, ph) * 0.6);
+    vg.addColorStop(0, 'rgba(255,250,238,0)');
+    vg.addColorStop(1, 'rgba(150,120,80,0.16)');
+    pc.fillStyle = vg;
+    pc.fillRect(0, 0, pw, ph);
+  }
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = Math.floor(W * dpr);
+    cv.height = Math.floor(H * dpr);
+    makePaper();
+    // the metaball field lives on a small grid and is scaled up smooth
+    SC = Math.min(GRID_MAX, Math.max(Math.min(700, GRID_MAX), Math.round(Math.max(W, H) * dpr * 0.9))) / Math.max(W, H);
+    GW = Math.max(2, Math.round(W * SC)); GH = Math.max(2, Math.round(H * SC));
+    field = document.createElement('canvas'); field.width = GW; field.height = GH;
+    fctx = field.getContext('2d', { willReadFrequently: true });
+    outc = document.createElement('canvas'); outc.width = GW; outc.height = GH;
+    octx = outc.getContext('2d');
+    // the gloss is worked out on a third-size grid and scaled up, which keeps it cheap and soft
+    LW = Math.max(2, Math.round(GW / 3)); LH = Math.max(2, Math.round(GH / 3));
+    loA = document.createElement('canvas'); loA.width = LW; loA.height = LH;
+    loB = document.createElement('canvas'); loB.width = LW; loB.height = LH;
+    lcA = loA.getContext('2d', { willReadFrequently: true });
+    lcB = loB.getContext('2d', { willReadFrequently: true });
+    hlc = document.createElement('canvas'); hlc.width = LW; hlc.height = LH;
+    hlx = hlc.getContext('2d');
+    hlImg = hlx.createImageData(LW, LH);
+    hlc2 = document.createElement('canvas'); hlc2.width = LW; hlc2.height = LH;
+    hlx2 = hlc2.getContext('2d');
+    hlImg2 = hlx2.createImageData(LW, LH);
+    hmask = document.createElement('canvas'); hmask.width = GW; hmask.height = GH;
+    hmx = hmask.getContext('2d');
+    if (typeof clock === 'number') draw(clock);
+  }
+
+  // a narrow cut keeps the edge crisp; the grid is fine enough that it stays smooth
+  var LUT = new Uint8Array(256);
+  for (var li = 0; li < 256; li++) {
+    var lv = clamp((li / 255 - 0.47) / 0.06, 0, 1);
+    LUT[li] = Math.round(255 * lv * lv * (3 - 2 * lv));
+  }
+
+  var blobs = [];
+  function pushBlob(x, y, r, asp, rot, kind) { blobs.push(x, y, r, asp, rot, kind); }
+
+  function draw(t) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(paper, 0, 0);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    var s = Math.min(W, H), cx = W / 2, cy = H / 2 - s * 0.02;
+    blobs.length = 0;
+
+    // a dot is always there: smaller and fainter asleep
+    var hgv = clamp(hg.e, 0, 1.3);
+    var rh = s * ((mode.awake ? 0.016 : 0.010) + 0.002 * Math.sin(t * 1.3) + 0.039 * hgv + 0.022 * mode.pulse);
+    pushBlob(0, 0, rh * 0.95, 1, 0, 0);
+
+    var cp = Math.cos(spin.pitch), sp = Math.sin(spin.pitch), cyw = Math.cos(spin.yaw), syw = Math.sin(spin.yaw), i;
+    function proj(o) {                       // turn a direction by the shared 3D rotation
+      var x1 = o.ux * cyw + o.uz * syw, z1 = -o.ux * syw + o.uz * cyw;
+      return { x: x1, y: o.uy * cp - z1 * sp, z: o.uy * sp + z1 * cp };
+    }
+    // head lobes: several lumps around the core, present from the first sound
+    if (hgv > 0.02) {
+      for (i = 0; i < NH; i++) {
+        var h = heads[i], q = proj(h), ps = 1 + 0.3 * q.z, off = rh * (0.35 + 0.75 * h.len) * 0.5;
+        pushBlob(q.x * off * ps, q.y * off * ps, rh * h.f * ps * (0.5 + 0.5 * Math.min(hgv, 1)), h.asp, h.rot, 1);
+      }
+    }
+    var L = s * 0.11;
+    for (i = 0; i < NA; i++) {
+      var a = arms[i];
+      if (a.e < 0.004 && a.r < 0.004) continue;
+      var p = proj(a), persp = 1 + 0.32 * p.z, ext = rh * 0.8 + a.e * L;
+      var rt = s * (0.022 + 0.03 * a.r) * persp, rm = (rh + rt) * 0.5, ang = Math.atan2(p.y, p.x);
+      pushBlob(p.x * ext * 0.5 * persp, p.y * ext * 0.5 * persp, rm, a.asp * 0.85, ang, 0);   // a joint, so limbs are solid
+      pushBlob(p.x * ext * persp, p.y * ext * persp, rt, a.asp, ang, 0);                       // the tip, stretched along the limb
+    }
+    for (i = 0; i < drops.length; i++) {
+      var d = drops[i];
+      pushBlob(d.x * s, d.y * s, s * d.r * clamp(d.life / d.life0, 0, 1), 1, 0, 0);
+    }
+
+    // accumulate the kernels, then cut the sum at a threshold to get a clean, joined outline
+    fctx.globalCompositeOperation = 'source-over';
+    fctx.clearRect(0, 0, GW, GH);
+    fctx.globalCompositeOperation = 'lighter';
+    var gx = GW / 2 + (cx - W / 2) * SC, gy = GH / 2 + (cy - H / 2) * SC;
+    for (i = 0; i < blobs.length; i += 6) {
+      var Rg = blobs[i + 2] / 0.54 * SC;
+      if (Rg < 0.4) continue;
+      var asp = blobs[i + 3], rx = Rg * Math.sqrt(asp), ry = Rg / Math.sqrt(asp);
+      fctx.setTransform(1, 0, 0, 1, gx + blobs[i] * SC, gy + blobs[i + 1] * SC);
+      fctx.rotate(blobs[i + 4]);
+      fctx.drawImage(blobs[i + 5] ? sprite2 : sprite, -rx, -ry, rx * 2, ry * 2);
+    }
+    fctx.setTransform(1, 0, 0, 1, 0, 0);
+    var img = fctx.getImageData(0, 0, GW, GH), px = img.data, u32 = new Uint32Array(img.data.buffer);
+    for (i = 0; i < u32.length; i++) u32[i] = LUT[px[(i << 2) + 3]] << 24;   // black, alpha from the cut
+    octx.putImageData(img, 0, 0);
+
+    ctx.save();
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.shadowColor = 'rgba(35,22,10,' + (0.34 + 0.1 * voice.env).toFixed(3) + ')';
+    ctx.shadowBlur = s * (0.03 + 0.015 * voice.slow) * dpr;
+    ctx.shadowOffsetX = s * 0.004 * dpr;
+    ctx.shadowOffsetY = s * (0.014 + 0.012 * voice.env) * dpr;
+    ctx.drawImage(outc, 0, 0, GW / SC, GH / SC);
+    ctx.restore();
+
+    if (hgv > 0.03 && perf.level < 1 && params.get('gloss') !== '0') gloss(t, s);
+
+    drawStatus();
+  }
+
+  // ---------- gloss: wet highlights worked out from the blob's own shape ----------
+  function softbox(u, v, cx, cy, hx, hy, soft) {
+    var a = 1 - Math.abs(u - cx) / hx, b = 1 - Math.abs(v - cy) / hy;
+    if (a <= 0 || b <= 0) return 0;
+    a = Math.min(1, a / soft); b = Math.min(1, b / soft);
+    return a * a * (3 - 2 * a) * b * b * (3 - 2 * b);
+  }
+
+  // What the photos show: the oil is almost pure black. Only the sides of the domes that face the room
+  // pick up a dim warm-grey glow, and only the edges facing the light carry a thin bright line set
+  // just inside the outline. Everything else stays black.
+  function gloss(t, s) {
+    var k = LW / GW, sigB = Math.max(3, 0.07 * s * SC * k);
+    var inset = Math.max(1.6, 0.011 * s * SC * k), sigE = inset / 0.84;
+    var i, x, y;
+    lcA.clearRect(0, 0, LW, LH); lcA.filter = 'blur(' + sigB.toFixed(1) + 'px)';
+    lcA.drawImage(outc, 0, 0, LW, LH); lcA.filter = 'none';
+    lcB.clearRect(0, 0, LW, LH); lcB.filter = 'blur(' + sigE.toFixed(1) + 'px)';
+    lcB.drawImage(outc, 0, 0, LW, LH); lcB.filter = 'none';
+    var A = lcA.getImageData(0, 0, LW, LH).data, B = lcB.getImageData(0, 0, LW, LH).data;
+    var glow = new Uint32Array(hlImg.data.buffer), line = new Uint32Array(hlImg2.data.buffer);
+    var K = 3.2 * sigB, rip = 0.03 + 0.05 * voice.slow;
+    var row = LW << 2;
+    for (y = 1; y < LH - 1; y++) {
+      for (x = 1; x < LW - 1; x++) {
+        i = y * LW + x;
+        var o = i << 2;
+        glow[i] = 0; line[i] = 0;
+        if (B[o + 3] < 40) continue;
+
+        // surface tilt from the broad dome, plus a little slow ripple
+        var x2 = (x > 2 && x < LW - 3) ? 8 : 4, y2 = (y > 2 && y < LH - 3) ? (LW << 3) : row;
+        var gx = (A[o + x2 + 3] - A[o - x2 + 3]) / (x2 * 0.5) / 255, gy = (A[o + y2 + 3] - A[o - y2 + 3]) / (y2 * 0.5) / 255;
+        var p1 = x * 0.17 + y * 0.11 + t * 0.7, p2 = x * 0.07 - y * 0.15 - t * 0.5;
+        var nx = -gx * K + rip * (0.8 * Math.cos(p1) + 0.5 * Math.cos(p2));
+        var ny = -gy * K + rip * (0.6 * Math.cos(p1) - 0.7 * Math.cos(p2));
+        var nz = 1 / Math.sqrt(1 + nx * nx + ny * ny);
+        var rx = 2 * nz * nz * nx, ry = 2 * nz * nz * ny;
+
+        // the broad glow: dim, warm, with a fairly defined side and a long fade into black
+        var G = 0.25 * softbox(rx, ry, -0.34, -0.40, 0.46, 0.34, 0.38)
+              + 0.13 * softbox(rx, ry, 0.46, 0.22, 0.32, 0.42, 0.5);
+        if (G > 0) glow[i] = (Math.round(G * 255) << 24) | (182 << 16) | (196 << 8) | 208;   // warm grey, little-endian ABGR
+
+        // the thin line: sits a fixed step inside the outline, only where the edge faces up-left
+        var ex = (B[o + 4 + 3] - B[o - 4 + 3]) * 0.5, ey = (B[o + row + 3] - B[o - row + 3]) * 0.5;
+        var em = Math.sqrt(ex * ex + ey * ey);
+        if (em > 1) {
+          var facing = (ex * 0.6 + ey * 0.8) / em;                      // outward normal is -grad; the light is up-left
+          var lv = B[o + 3] / 255 - 0.8, w = Math.exp(-(lv * lv) / 0.0032);
+          var brk = 0.62 + 0.38 * Math.sin(Math.atan2(ey, ex) * 3 + 1.3);   // it breaks up along the edge, as it does in the photos
+          var L = w * brk * (0.10 + 0.62 * Math.max(0, facing));
+          if (L > 0.01) line[i] = (Math.round(L * 255) << 24) | (250 << 16) | (246 << 8) | 240;
+        }
+      }
+    }
+    hlx.putImageData(hlImg, 0, 0);
+    hlx2.putImageData(hlImg2, 0, 0);
+
+    hmx.globalCompositeOperation = 'source-over';
+    hmx.clearRect(0, 0, GW, GH);
+    hmx.imageSmoothingEnabled = true; hmx.imageSmoothingQuality = 'high';
+    hmx.filter = 'blur(2px)';                   // the glow is soft...
+    hmx.drawImage(hlc, 0, 0, GW, GH);
+    hmx.filter = 'none';                        // ...the line is not
+    hmx.drawImage(hlc2, 0, 0, GW, GH);
+    hmx.globalCompositeOperation = 'destination-in';
+    hmx.drawImage(outc, 0, 0);
+    hmx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(hmask, 0, 0, GW / SC, GH / SC);
+  }
+
+  // ---------- on-canvas status, so you can see the mic is really connected ----------
+  var MIC_ERR = {
+    NotAllowedError: 'blocked: allow the microphone in the address bar, then click the page',
+    NotFoundError: 'no microphone found',
+    NotReadableError: 'the microphone is busy in another app',
+    unsupported: 'this browser has no microphone access here (use Chrome on http://localhost)',
+    SecurityError: 'blocked: open this from http://localhost, not a file'
+  };
+
+  function drawStatus() {
+    var line1, line2, ok = false;
+    if (DEMO) { line1 = 'demo voice, no microphone'; ok = true; }
+    else if (audio.state === 'live') {
+      ok = true;
+      if (audio.ac && audio.ac.state === 'suspended') { line1 = 'microphone ready: click the page to start audio'; ok = false; }
+      else line1 = vad.calibrating ? 'microphone connected: learning the room, stay quiet a moment' : 'microphone connected: ' + audio.label + '  \u00b7  ' + (vad.snrDb >= 0 ? '+' : '') + Math.round(vad.snrDb) + ' dB over the room';
+    }
+    else if (audio.state === 'asking') line1 = 'waiting for microphone permission';
+    else if (audio.state === 'lost') line1 = 'microphone disconnected: click the page to reconnect';
+    else if (audio.state === 'denied') line1 = 'microphone ' + (MIC_ERR[audio.err] || ('error: ' + audio.err));
+    else line1 = 'click the page to connect the microphone';
+
+    if (lastErr) line1 = 'error: ' + lastErr;
+    else if (line1) line1 += '  \u00b7  ' + Math.round(1000 / perf.ms) + ' fps' + (perf.level ? ' (reduced)' : '');
+    if (mode.awake) line2 = ALWAYS ? 'awake' : 'awake: speak, it sleeps after ' + SLEEP_AFTER + ' s of quiet';
+    else if (ALWAYS) line2 = '';
+    else if (kw.state === 'unsupported') line2 = 'asleep: no speech recogniser here, press O to wake it';
+    else if (kw.state === 'blocked') line2 = 'asleep: speech recognition was blocked, press O to wake it';
+    else if (kw.state === 'network') line2 = 'asleep: speech recogniser is offline, press O to wake it';
+    else line2 = 'asleep: say “orange” (or press O)' + (kw.last ? '  ·  heard: “' + kw.last + '”' : '  ·  hearing nothing yet') + (kw.err && kw.err !== 'no-speech' && kw.err !== 'aborted' ? '  ·  ' + kw.err : '');
+
+    // level meter: the bar is what the detector sees, and it turns solid when it decides "voice"
+    var mw = 120, mx = W / 2 - mw / 2, my = H - 66;
+    if (ok && !DEMO || DEMO) {
+      ctx.fillStyle = 'rgba(30,20,10,0.12)';
+      ctx.fillRect(mx, my, mw, 3);
+      ctx.fillStyle = vad.active ? 'rgba(20,12,4,0.85)' : 'rgba(30,20,10,0.35)';
+      ctx.fillRect(mx, my, mw * clamp(vad.snrDb / 30, 0, 1), 3);
+    }
+    ctx.font = 'italic 13px Georgia, "Times New Roman", serif';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(30,20,10,0.55)';
+    ctx.fillText(line1, W / 2, H - 38);
+    if (line2) ctx.fillText(line2, W / 2, H - 18);
+  }
+
+  // ---------- loop ----------
+  var GRID_MAX = 1100;
+  var clock = 0, last = null, paused = false, acc = 0, FIXED = 1 / 120;
+  var perf = { ms: 16, slowFor: 0, level: 0 };   // level 0 full, 1 no gloss, 2 no gloss and a coarser grid
+  var lastErr = '';
+  function frame(now) {
+    var t0 = performance.now();
+    try {
+      if (last !== null && !paused) {
+        var dt = Math.min((now - last) / 1000, 0.05);
+        clock += dt;
+        updateVoice(clock, dt);
+        maybeSpawnDrops();
+        acc += dt;
+        var guard = 0;
+        while (acc >= FIXED && guard++ < 12) { step(FIXED, clock); acc -= FIXED; }
+      }
+    } catch (e) { lastErr = 'update: ' + (e && e.message || e); }
+    if (last !== null) {
+      perf.ms += ((now - last) - perf.ms) * 0.05;
+      perf.slowFor = perf.ms > 34 ? perf.slowFor + (now - last) / 1000 : 0;
+      if (perf.slowFor > 1.5 && perf.level < 2) {          // too slow for 1.5 s: drop the expensive parts
+        perf.level++; perf.slowFor = 0; perf.ms = 16;
+        if (perf.level === 2) { GRID_MAX = 640; resize(); }
+      }
+    }
+    last = now;
+    try { draw(clock); } catch (e) { lastErr = 'draw: ' + (e && e.message || e); }
+    requestAnimationFrame(frame);
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('pointerdown', startMic);
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' || e.key === ' ') { e.preventDefault(); if (!e.repeat) paused = !paused; }
+    else if (e.key === 'o' || e.key === 'O') { wake('key'); startMic(); }
+    else startMic();
+  });
+
+  window.__ink = { vad: vad, voice: voice, mode: mode, audio: audio, kw: kw };   // for debugging in the console
+  makeSprite();
+  resize();
+  requestAnimationFrame(frame);
+  startMic();   // asks for the mic straight away; a click retries if it was refused
+})();
+</script>
+</body>
+</html>

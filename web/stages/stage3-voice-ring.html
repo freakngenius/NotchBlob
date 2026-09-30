@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Voice ink ring</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #f2ecdf; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* Stage 3, rebuilt from the original: the ring as a soft, springy body that a voice pushes around.
+   Click to allow the mic, or add ?demo=1 to drive it with a made-up voice. */
+(function () {
+  var cv = document.getElementById('c');
+  var ctx = cv.getContext('2d');
+  var params = new URLSearchParams(location.search);
+  var TAU = Math.PI * 2;
+  var q = params.get('seed');
+  function hashStr(s) {
+    var h = 2166136261;
+    for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return h >>> 0;
+  }
+  var seed = q === null ? 1 : (/^-?\d+$/.test(q.trim()) ? (parseInt(q, 10) >>> 0) : hashStr(q));
+  function mulberry(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var R = mulberry(seed * 2654435761 >>> 0);
+  function rand(a, b) { return a + (b - a) * R(); }
+  function clamp(x, a, b) { return x < a ? a : x > b ? b : x; }
+
+  var LOOP = 20;
+  function harmonics(kMin, kMax, amp, falloff, mMax) {
+    var list = [];
+    for (var k = kMin; k <= kMax; k++) {
+      var m = Math.ceil(R() * mMax) * (R() < 0.5 ? -1 : 1);
+      list.push({ k: k, a: amp * rand(0.3, 1) / Math.pow(k, falloff), p: rand(0, TAU), w: m * TAU / LOOP });
+    }
+    return list;
+  }
+  function sample(list, th, t) {
+    var s = 0;
+    for (var i = 0; i < list.length; i++) { var h = list[i]; s += h.a * Math.sin(h.k * th + h.p + h.w * t); }
+    return s;
+  }
+  var P = {
+    radius: rand(0.24, 0.28), weight: rand(0.24, 0.36), dx: rand(-0.02, 0.02), dy: rand(-0.02, 0.01),
+    body: harmonics(1, 4, 0.04, 1.0, 1), press: harmonics(1, 2, 0.16, 0.9, 1),
+    edgeOut: harmonics(2, 6, 0.008, 0.6, 2), edgeIn: harmonics(2, 6, 0.008, 0.6, 2)
+  };
+
+  var NB = 6;
+  var voice = { env: 0, slow: 0, bands: new Float32Array(NB), peak: 0.06, bandPeak: new Float32Array(NB).fill(0.12) };
+  var audio = { state: 'idle', an: null, td: null, fd: null, edges: null, msgAt: 0 };
+  var demo = params.get('demo') === '1';
+  if (demo) audio.state = 'demo';
+
+  function startMic() {
+    if (audio.state !== 'idle') return;
+    audio.state = 'asking';
+    var md = navigator.mediaDevices;
+    if (!md || !md.getUserMedia) { audio.state = 'denied'; return; }
+    md.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } })
+      .then(function (stream) {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        var ac = new AC();
+        var src = ac.createMediaStreamSource(stream);
+        var an = ac.createAnalyser();
+        an.fftSize = 1024; an.smoothingTimeConstant = 0.5;
+        src.connect(an);
+        audio.an = an; audio.td = new Uint8Array(an.fftSize); audio.fd = new Uint8Array(an.frequencyBinCount);
+        var hzPerBin = ac.sampleRate / an.fftSize;
+        var hz = [80, 180, 360, 720, 1500, 3000, 6500];
+        audio.edges = hz.map(function (f) { return Math.max(1, Math.round(f / hzPerBin)); });
+        audio.state = 'live'; audio.msgAt = performance.now();
+        if (ac.state === 'suspended') ac.resume();
+      })
+      .catch(function () { audio.state = 'denied'; audio.msgAt = performance.now(); });
+  }
+
+  function demoVoice(t) {
+    var phrase = clamp(Math.sin(TAU * 0.13 * t + 1.0) * 3 + 0.8, 0, 1);
+    var syl = Math.pow(Math.max(0, Math.sin(TAU * (2.6 + 0.7 * Math.sin(TAU * 0.11 * t)) * t)), 1.4);
+    var raw = phrase * (0.25 + 0.75 * syl);
+    var b = [];
+    for (var j = 0; j < NB; j++) b.push(raw * clamp(0.55 + 0.6 * Math.sin(t * (1.1 + j * 0.63) + j * 1.9) * Math.sin(t * 0.37 + j), 0, 1));
+    return { level: raw, bands: b };
+  }
+
+  function updateVoice(t) {
+    var level = 0, bands = null;
+    if (audio.state === 'live') {
+      audio.an.getByteTimeDomainData(audio.td);
+      var sum = 0, td = audio.td;
+      for (var i = 0; i < td.length; i++) { var v = (td[i] - 128) / 128; sum += v * v; }
+      var rms = Math.sqrt(sum / td.length);
+      voice.peak = Math.max(voice.peak * 0.9993, rms, 0.05);
+      level = Math.pow(clamp((rms - 0.012) / (voice.peak - 0.012), 0, 1), 0.8);
+      audio.an.getByteFrequencyData(audio.fd);
+      bands = [];
+      for (var j = 0; j < NB; j++) {
+        var a = audio.edges[j], b = Math.max(a + 1, audio.edges[j + 1]), s = 0;
+        for (var k = a; k < b; k++) s += audio.fd[k];
+        var e = s / (b - a) / 255;
+        voice.bandPeak[j] = Math.max(voice.bandPeak[j] * 0.9993, e, 0.1);
+        bands.push(Math.min(1, e / voice.bandPeak[j]) * Math.min(1, level * 3));
+      }
+    } else if (audio.state === 'demo') {
+      var d = demoVoice(t); level = d.level; bands = d.bands;
+    }
+    voice.env += (level - voice.env) * (level > voice.env ? 0.45 : 0.07);
+    voice.slow += (level - voice.slow) * 0.02;
+    for (var m = 0; m < NB; m++) {
+      var x = bands ? bands[m] : 0;
+      voice.bands[m] += (x - voice.bands[m]) * (x > voice.bands[m] ? 0.5 : 0.08);
+    }
+  }
+
+  var N = 220;
+  var dF = new Float32Array(N), dV = new Float32Array(N), hF = new Float32Array(N), hV = new Float32Array(N);
+  var fd = new Float32Array(N), fh = new Float32Array(N), lap = new Float32Array(N);
+  var lobes = [];
+  for (var j = 0; j < NB; j++) {
+    lobes.push({
+      base: (j + rand(-0.3, 0.3)) / NB * TAU,
+      p1: rand(0, TAU), p2: rand(0, TAU), p3: rand(0, TAU), p4: rand(0, TAU),
+      s1: rand(0.6, 1.3), s2: rand(1.4, 2.3), s3: rand(0.5, 1.1), s4: rand(0.4, 0.9),
+      sig: rand(0.26, 0.42), bias: rand(0.25, 0.6)
+    });
+  }
+  var PHYS = { kd: 16, cd: 4.2, nu: 1100, visc: 22, kh: 5, ch: 7.5, nuh: 500, visch: 26, gd: 22, gh: 5.5 };
+
+  function integrate(u, v, f, k, c, nu, visc, dt) {
+    var i, a, b;
+    for (i = 0; i < N; i++) { a = u[(i + N - 1) % N]; b = u[(i + 1) % N]; lap[i] = a + b - 2 * u[i]; }
+    for (i = 0; i < N; i++) v[i] += (f[i] - k * u[i] - c * v[i] + nu * lap[i]) * dt;
+    for (i = 0; i < N; i++) { a = v[(i + N - 1) % N]; b = v[(i + 1) % N]; lap[i] = a + b - 2 * v[i]; }
+    for (i = 0; i < N; i++) { v[i] += visc * lap[i] * dt; u[i] += v[i] * dt; }
+  }
+  function step(dt, speed) {
+    var i, j;
+    fd.fill(0); fh.fill(0);
+    for (j = 0; j < NB; j++) {
+      var L = lobes[j], E = Math.pow(voice.bands[j], 1.15);
+      if (E < 0.005) continue;
+      var ang = L.base + 0.9 * Math.sin(L.p1) + 0.55 * Math.sin(L.p2);
+      var sig = L.sig * (1 + 0.9 * voice.env) * (0.8 + 0.3 * Math.sin(L.p3));
+      var sgn = L.bias + (1 - L.bias) * Math.sin(L.p4);
+      for (i = 0; i < N; i++) {
+        var dth = i / N * TAU - ang;
+        dth -= Math.round(dth / TAU) * TAU;
+        var g = Math.exp(-0.5 * dth * dth / (sig * sig));
+        fd[i] += PHYS.gd * E * sgn * g;
+        fh[i] += PHYS.gh * E * Math.exp(-0.5 * dth * dth / (sig * sig * 2.2));
+      }
+    }
+    var spread = PHYS.gh * 0.35 * voice.env;
+    for (i = 0; i < N; i++) fh[i] += spread;
+    integrate(dF, dV, fd, PHYS.kd, PHYS.cd, PHYS.nu, PHYS.visc, dt);
+    integrate(hF, hV, fh, PHYS.kh, PHYS.ch, PHYS.nuh, PHYS.visch, dt);
+    for (i = 0; i < N; i++) { dF[i] = clamp(dF[i], -0.4, 0.45); hF[i] = clamp(hF[i], -0.3, 0.75); }
+    for (j = 0; j < NB; j++) {
+      var Q = lobes[j], sp = speed * dt;
+      Q.p1 += Q.s1 * sp; Q.p2 += Q.s2 * sp; Q.p3 += Q.s3 * sp; Q.p4 += Q.s4 * sp;
+    }
+  }
+
+  var W = 0, H = 0, dpr = 1, paper = null;
+  function makePaper() {
+    var pw = Math.floor(W * dpr), ph = Math.floor(H * dpr);
+    paper = document.createElement('canvas'); paper.width = pw; paper.height = ph;
+    var pc = paper.getContext('2d');
+    var pr = mulberry(seed ^ 0x9e3779b9);
+    pc.fillStyle = '#f2ecdf'; pc.fillRect(0, 0, pw, ph);
+    var gw = Math.ceil(pw / 2), gh = Math.ceil(ph / 2);
+    var g = document.createElement('canvas'); g.width = gw; g.height = gh;
+    var gc = g.getContext('2d');
+    var img = gc.createImageData(gw, gh), d = img.data;
+    for (var i = 0; i < d.length; i += 4) { var v = pr() < 0.5 ? 0 : 255; d[i] = d[i + 1] = d[i + 2] = v; d[i + 3] = Math.floor(pr() * 9); }
+    gc.putImageData(img, 0, 0);
+    pc.drawImage(g, 0, 0, pw, ph);
+    var vg = pc.createRadialGradient(pw / 2, ph / 2, Math.min(pw, ph) * 0.35, pw / 2, ph / 2, Math.hypot(pw, ph) * 0.6);
+    vg.addColorStop(0, 'rgba(255,250,238,0)'); vg.addColorStop(1, 'rgba(150,120,80,0.16)');
+    pc.fillStyle = vg; pc.fillRect(0, 0, pw, ph);
+  }
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = Math.floor(W * dpr); cv.height = Math.floor(H * dpr);
+    makePaper();
+    if (typeof clock === 'number') draw(clock);
+  }
+  function smoothLoop(p) {
+    var n = p.length / 2, i;
+    ctx.moveTo((p[0] + p[2 * (n - 1)]) / 2, (p[1] + p[2 * (n - 1) + 1]) / 2);
+    for (i = 0; i < n; i++) {
+      var j = (i + 1) % n;
+      ctx.quadraticCurveTo(p[2 * i], p[2 * i + 1], (p[2 * i] + p[2 * j]) / 2, (p[2 * i + 1] + p[2 * j + 1]) / 2);
+    }
+    ctx.closePath();
+  }
+  var outer = new Float32Array(N * 2), inner = new Float32Array(N * 2);
+  function draw(t) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(paper, 0, 0);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    var s = Math.min(W, H);
+    var cx = W / 2 + P.dx * s, cy = H / 2 + P.dy * s;
+    var mid = P.radius * s;
+    var breath = 0.09 * voice.slow + 0.03 * voice.env;
+    for (var i = 0; i < N; i++) {
+      var th = i / N * TAU, d = dF[i], h = hF[i];
+      var rc = mid * (1 + breath + sample(P.body, th, t));
+      var w = Math.max(mid * P.weight * (1 + sample(P.press, th, t) + h), mid * 0.07);
+      var ro = rc + w / 2 + mid * d + mid * sample(P.edgeOut, th, t);
+      var ri = Math.max(rc - w / 2 + mid * d * 0.6 + mid * sample(P.edgeIn, th, t), mid * 0.14);
+      if (ro < ri + mid * 0.06) ro = ri + mid * 0.06;
+      var c = Math.cos(th), sn = Math.sin(th);
+      outer[2 * i] = cx + c * ro; outer[2 * i + 1] = cy + sn * ro;
+      inner[2 * i] = cx + c * ri; inner[2 * i + 1] = cy + sn * ri;
+    }
+    ctx.beginPath(); smoothLoop(outer); smoothLoop(inner);
+    ctx.save();
+    ctx.shadowColor = 'rgba(35,22,10,' + (0.36 + 0.1 * voice.env).toFixed(3) + ')';
+    ctx.shadowBlur = s * (0.045 + 0.02 * voice.env) * dpr;
+    ctx.shadowOffsetX = s * 0.004 * dpr;
+    ctx.shadowOffsetY = s * (0.016 + 0.008 * voice.env) * dpr;
+    ctx.fillStyle = '#000';
+    ctx.fill('evenodd');
+    ctx.restore();
+  }
+
+  var clock = 0, last = null, paused = false, acc = 0, FIXED = 1 / 120;
+  function frame(now) {
+    if (last !== null && !paused) {
+      var dt = Math.min((now - last) / 1000, 0.05);
+      clock += dt;
+      updateVoice(clock);
+      var speed = 0.35 + 2.6 * voice.env;
+      acc += dt;
+      var guard = 0;
+      while (acc >= FIXED && guard++ < 12) { step(FIXED, speed); acc -= FIXED; }
+    }
+    last = now;
+    draw(clock);
+    requestAnimationFrame(frame);
+  }
+  window.addEventListener('resize', resize);
+  window.addEventListener('pointerdown', startMic);
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' || e.key === ' ') { e.preventDefault(); if (!e.repeat) paused = !paused; }
+    else startMic();
+  });
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
