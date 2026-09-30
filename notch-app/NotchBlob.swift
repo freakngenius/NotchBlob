@@ -1,4 +1,4 @@
-// NotchAlive: a black overlay that sits exactly on the MacBook notch and, while you speak,
+// NotchBlob: a black overlay that sits exactly on the MacBook notch and, while you speak,
 // swells outward a little in organic lumps, then settles back to the exact notch shape.
 //
 // Nothing is recorded or stored. Audio is analysed in memory and thrown away.
@@ -553,6 +553,24 @@ final class Controller: NSObject, NSApplicationDelegate {
         window.orderFrontRegardless()
     }
 
+    // a small template blob, so the menu bar tints it for light and dark
+    static func menuBarBlob() -> NSImage {
+        let img = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { rect in
+            let p = NSBezierPath()
+            let n = 90
+            for i in 0...n {
+                let t = Double(i) / Double(n) * 2 * .pi
+                let k = 1 + 0.13 * sin(2 * t + 0.6) + 0.09 * sin(3 * t + 2.1) + 0.05 * sin(5 * t + 4.0) + 0.04 * sin(t + 1.0)
+                let pt = NSPoint(x: rect.midX + cos(t) * 6.4 * k, y: rect.midY + sin(t) * 6.4 * k * 0.94)
+                i == 0 ? p.move(to: pt) : p.line(to: pt)
+            }
+            p.close(); NSColor.black.setFill(); p.fill()
+            return true
+        }
+        img.isTemplate = true
+        return img
+    }
+
     @objc func screensChanged() { buildWindow() }
 
     var currentGrowth: CGFloat = 1
@@ -560,7 +578,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     func buildMenu() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let b = statusItem.button {
-            b.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Notch Alive")
+            b.image = Controller.menuBarBlob()
         }
         let menu = NSMenu()
         statusLine.isEnabled = false

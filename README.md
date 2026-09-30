@@ -7,7 +7,7 @@ Free, no accounts, no API keys, no network. Audio is analysed live on your Mac a
 ## Install (copy and paste into Terminal)
 
 ```bash
-xcode-select --install 2>/dev/null; git clone https://github.com/freakngenius/NotchBlob.git && cd NotchBlob/notch-app && ./build.sh && open NotchAlive.app
+xcode-select --install 2>/dev/null; git clone https://github.com/freakngenius/NotchBlob.git && cd NotchBlob/notch-app && ./build.sh && open NotchBlob.app
 ```
 
 If a dialog appears for the Xcode command line tools, finish that install, then run the same line again.
@@ -32,7 +32,7 @@ Click the waveform icon in the menu bar:
 - **Use a fake voice (test)**: animates with a synthetic voice, no microphone needed.
 - **Quit**.
 
-To start it on login: System Settings > General > Login Items > add `NotchAlive.app`.
+To start it on login: System Settings > General > Login Items > add `NotchBlob.app`.
 
 ## How it works
 
@@ -48,11 +48,12 @@ To start it on login: System Settings > General > Login Items > add `NotchAlive.
 
 ## Troubleshooting
 
-- **Nothing happens**: make sure Microphone is allowed for Notch Alive in System Settings > Privacy & Security > Microphone. The menu's top line shows the mic state and level.
+- **Nothing happens**: make sure Microphone is allowed for Notch Blob in System Settings > Privacy & Security > Microphone. The menu's top line shows the mic state and level.
 - **It is asleep**: if you turned on the "blob" wake word, say "blob" or choose "Wake now".
-- **Changed the permission after first launch**: quit, then reopen `NotchAlive.app`.
-- **Start over on permissions**: `tccutil reset Microphone io.github.notchalive.app` and `tccutil reset SpeechRecognition io.github.notchalive.app`.
+- **Changed the permission after first launch**: quit, then reopen `NotchBlob.app`.
+- **Start over on permissions**: `tccutil reset Microphone io.github.notchblob.app` and `tccutil reset SpeechRecognition io.github.notchblob.app`.
 - The app is ad-hoc signed and built on your machine, so there is no Gatekeeper "unidentified developer" prompt.
+- The icon is drawn by `notch-app/make-icon.swift` (run `swiftc make-icon.swift -o /tmp/mk && mkdir x.iconset && /tmp/mk x.iconset && iconutil -c icns x.iconset -o AppIcon.icns` to regenerate).
 
 ## The browser versions (`web/`)
 
