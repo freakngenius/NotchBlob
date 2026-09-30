@@ -1,2 +1,0 @@
-NotchAlive.app: replacing existing signature
-built NotchAlive.app
