@@ -65,7 +65,7 @@ final class VoiceAnalyzer {
     private var fft: FFTSetup
     private var hann: [Float]
     private var ring: [Float] = []
-    private var sampleRate = 48000.0
+    fileprivate var sampleRate = 48000.0
     private var seen = 0.0
 
     // detector state
@@ -77,6 +77,11 @@ final class VoiceAnalyzer {
     private var peakDb = 14.0
     private var calibStart: Double? = nil
     private var calibFrames = 0
+    // voice isolation: speech is periodic (pitch 70-400 Hz); fans, rooms and typing are not
+    fileprivate var hist = [Float]()
+    private var lastVoiced = -9.0
+    private var onsetFrames = 0
+    var voicing = 0.0           // latest periodicity, 0...1, for the menu readout
 
     var running = false
     // called on the audio thread with every raw buffer; the wake-word listener taps in here
@@ -135,6 +140,9 @@ final class VoiceAnalyzer {
             }
         }
 
+        hist.append(contentsOf: x[(N - hop)..<N])
+        if hist.count > 2048 { hist.removeFirst(hist.count - 2048) }
+
         let t = seen / sampleRate
         let hz = sampleRate / Double(N)
         let dtF = Double(hop) / sampleRate
@@ -175,9 +183,14 @@ final class VoiceAnalyzer {
         floorP = max(floorP + (speechP - floorP) * fr, 1e-13)
         let snrDb = 10 * log10((speechP + 1e-20) / floorP)
 
-        let cand = active ? (snrDb > 3 && ratio > 0.12) : (snrDb > 6 && ratio > 0.2)
-        if cand { lastVoice = t; active = true }
-        else if t - lastVoice > 0.05 { active = false }
+        voicing = periodicity()
+        if voicing > 0.55 && snrDb > 5 { lastVoiced = t }
+        // a hum or a cough can be loud; only something with a voice's pitch recently behind it counts
+        let voiced = t - lastVoiced < 0.3
+        let cand = voiced && (active ? (snrDb > 4 && ratio > 0.15) : (snrDb > 8 && ratio > 0.25))
+        onsetFrames = cand ? onsetFrames + 1 : 0
+        if cand && (active || onsetFrames >= 3) { lastVoice = t; active = true }
+        else if t - lastVoice > 0.08 { active = false }
 
         peakDb = max(peakDb - 0.03 * dtF / 0.0167, snrDb, 14)
         let level = active ? pow(min(max((snrDb - 4) / (peakDb - 4), 0), 1), 0.6) : 0
@@ -190,6 +203,33 @@ final class VoiceAnalyzer {
             bands[j] = active ? Float(min(max((db - 3) / 14, 0), 1)) : 0
         }
         publish(VoiceState(active: active, level: Float(level), bands: bands, snrDb: Float(snrDb), calibrating: false))
+    }
+}
+
+extension VoiceAnalyzer {
+    /// Strongest normalised autocorrelation between 70 and 400 Hz on a 12 kHz copy of the last ~43 ms.
+    fileprivate func periodicity() -> Double {
+        guard hist.count >= 2048 else { return 0 }
+        let d = max(1, Int(sampleRate / 12000)), rate = sampleRate / Double(d)
+        let m = hist.count / d
+        var y = [Float](repeating: 0, count: m)
+        for i in 0..<m { var a: Float = 0; for k in 0..<d { a += hist[i * d + k] }; y[i] = a / Float(d) }
+        let mean = y.reduce(0, +) / Float(m)
+        for i in 0..<m { y[i] -= mean }
+        let lo = Int(rate / 400), hi = min(Int(rate / 70), m / 2)
+        var best: Double = 0
+        for lag in lo...hi {
+            var c: Float = 0, e0: Float = 0, e1: Float = 0
+            let n = m - lag
+            y.withUnsafeBufferPointer { p in
+                vDSP_dotpr(p.baseAddress!, 1, p.baseAddress! + lag, 1, &c, vDSP_Length(n))
+                vDSP_svesq(p.baseAddress!, 1, &e0, vDSP_Length(n))
+                vDSP_svesq(p.baseAddress! + lag, 1, &e1, vDSP_Length(n))
+            }
+            let r = Double(c / (sqrt(e0 * e1) + 1e-12))
+            if r > best { best = r }
+        }
+        return best
     }
 }
 

@@ -40,6 +40,7 @@ To start it on login: System Settings > General > Login Items > add `NotchBlob.a
 
 - A borderless, click-through window sits above the menu bar, exactly over the notch (geometry read from the screen's safe-area insets).
 - The microphone feeds a 1024-point FFT. A noise-adaptive voice detector (speech band 250 to 3800 Hz, signal over a learned noise floor, hysteresis) separates your voice from room noise, so typing and fans do not trigger it.
+- Voice isolation: besides the loudness gate, the detector checks for a voice's pitch (a repeating pattern between 70 and 400 Hz), so fans, typing and room noise don't move it.
 - The outline is a spring-and-diffusion simulation of points around the notch, pushed by six frequency bands with a thick, viscous feel, so it moves in lumpy organic shapes, not a simple pulse.
 
 ## Privacy and cost
